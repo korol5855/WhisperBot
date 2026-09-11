@@ -5,6 +5,7 @@ import tempfile
 import html
 
 from telegram import Update
+from telegram.constants import ChatAction
 from telegram.ext import (
     ApplicationBuilder,
     MessageHandler,
@@ -14,123 +15,400 @@ from telegram.ext import (
 )
 from groq import AsyncGroq
 
-# Налаштування логування
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("WhisperBot")
+
+# =========================================================
+# НАЛАШТУВАННЯ
+# =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
-if not BOT_TOKEN or not GROQ_API_KEY:
-    raise RuntimeError("❌ Не задано BOT_TOKEN або GROQ_API_KEY!")
+if not BOT_TOKEN:
+    raise RuntimeError("❌ Не задано BOT_TOKEN!")
 
-client = AsyncGroq(api_key=GROQ_API_KEY, timeout=120.0)
+if not GROQ_API_KEY:
+    raise RuntimeError("❌ Не задано GROQ_API_KEY!")
+
+
 WHISPER_MODEL = "whisper-large-v3"
 
-transcription_semaphore = asyncio.Semaphore(3)
+# Одночасно максимум 3 транскрипції
+TRANSCRIPTION_LIMIT = 3
+transcription_semaphore = asyncio.Semaphore(TRANSCRIPTION_LIMIT)
+
+# Максимальний розмір файлу
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message:
-        await update.message.reply_text(
-            "🎙️ WhisperBot готовий до роботи. Надішли голосове повідомлення.",
-        )
 
-async def transcribe_voice(file_path: str) -> str:
-    async with transcription_semaphore:
-        with open(file_path, "rb") as audio_file:
-            result = await client.audio.transcriptions.create(
-                model=WHISPER_MODEL,
-                file=("voice.ogg", audio_file),
-                response_format="json",
-                temperature=0.0,
-                initial_prompt=(
-                    "Транскрибуй максимально дослівно та точно. "
-                    "Мова розмови: мікс української, російської та суржику. "
-                    "Не вигадуй слова, не виправляй граматику, не перекладай іншими мовами. "
-                    "Фіксуй саме те, що реально звучить в аудіо."
-                ),
-            )
-            return result.text.strip()
+# =========================================================
+# ЛОГУВАННЯ
+# =========================================================
 
-async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if not message or not message.voice:
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
+)
+
+logger = logging.getLogger("WhisperBot")
+
+
+# =========================================================
+# GROQ
+# =========================================================
+
+client = AsyncGroq(
+    api_key=GROQ_API_KEY,
+    timeout=120.0,
+)
+
+
+# =========================================================
+# /START
+# =========================================================
+
+async def cmd_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.message:
         return
 
-    if message.voice.file_size and message.voice.file_size > MAX_FILE_SIZE:
+    await update.message.reply_text(
+        "🎙️ <b>WhisperBot готовий.</b>\n\n"
+        "Надішли голосове повідомлення або аудіофайл — "
+        "я перетворю його на текст.",
+        parse_mode="HTML",
+    )
+
+
+# =========================================================
+# ТРАНСКРИПЦІЯ
+# =========================================================
+
+async def transcribe_audio(
+    file_path: str,
+    filename: str,
+) -> str:
+
+    async with transcription_semaphore:
+
+        logger.info(
+            "Починаю транскрипцію: %s",
+            filename,
+        )
+
+        with open(file_path, "rb") as audio_file:
+
+            result = await client.audio.transcriptions.create(
+                model=WHISPER_MODEL,
+
+                file=(
+                    filename,
+                    audio_file,
+                ),
+
+                response_format="json",
+
+                temperature=0.0,
+
+                initial_prompt=(
+                    "Українська, російська мова та суржик. "
+                    "Транскрибуй максимально дослівно. "
+                    "Зберігай слова, сленг, мат, помилки, "
+                    "повтори та особливості мовлення. "
+                    "Не перекладай. "
+                    "Не перефразовуй. "
+                    "Не роби текст красивішим. "
+                    "Не виправляй граматику. "
+                    "Передавай саме те, що було сказано."
+                ),
+            )
+
+        text = result.text.strip()
+
+        logger.info(
+            "Транскрипцію завершено. Символів: %d",
+            len(text),
+        )
+
+        return text
+
+
+# =========================================================
+# ОБРОБКА АУДІО
+# =========================================================
+
+async def handle_audio(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    message = update.message
+
+    if not message:
+        return
+
+    # -----------------------------------------------------
+    # Визначаємо тип повідомлення
+    # -----------------------------------------------------
+
+    if message.voice:
+        telegram_media = message.voice
+        filename = "voice.ogg"
+
+    elif message.audio:
+        telegram_media = message.audio
+
+        filename = (
+            message.audio.file_name
+            or "audio.mp3"
+        )
+
+    else:
+        return
+
+    # -----------------------------------------------------
+    # Перевірка розміру
+    # -----------------------------------------------------
+
+    if (
+        telegram_media.file_size
+        and telegram_media.file_size > MAX_FILE_SIZE
+    ):
         await message.reply_text(
-            "❌ Голосове занадто велике (максимум 25 МБ).",
+            "❌ Файл занадто великий.\n"
+            "Максимальний розмір — 25 МБ.",
             reply_to_message_id=message.message_id,
         )
         return
 
-    voice_path = None
+    temp_path = None
+    status_message = None
+
     try:
-        telegram_file = await context.bot.get_file(message.voice.file_id)
 
-        with tempfile.NamedTemporaryFile(suffix=".ogg", delete=False) as temp_file:
-            voice_path = temp_file.name
+        # -------------------------------------------------
+        # Статус
+        # -------------------------------------------------
 
-        await telegram_file.download_to_drive(custom_path=voice_path)
+        await context.bot.send_chat_action(
+            chat_id=message.chat_id,
+            action=ChatAction.TYPING,
+        )
 
-        if os.path.getsize(voice_path) > MAX_FILE_SIZE:
-            await message.reply_text(
-                "❌ Голосове занадто велике.",
-                reply_to_message_id=message.message_id,
-            )
-            return
-
-        text = await transcribe_voice(voice_path)
-
-        if not text:
-            await message.reply_text(
-                "🤷 Не зміг розібрати текст.",
-                reply_to_message_id=message.message_id,
-            )
-            return
-
-        safe_text = html.escape(text)
-        result_text = f"<blockquote expandable>{safe_text}</blockquote>"
-
-        await message.reply_text(
-            result_text,
+        status_message = await message.reply_text(
+            "🎙️ <i>Розпізнаю...</i>",
             parse_mode="HTML",
             reply_to_message_id=message.message_id,
         )
 
-    except Exception as e:
-        logger.exception(f"Помилка обробки: {e}")
-        try:
-            await message.reply_text(
-                "❌ Помилка розпізнавання.",
-                reply_to_message_id=message.message_id,
-            )
-        except:
-            pass
-    finally:
-        if voice_path and os.path.exists(voice_path):
-            try:
-                os.remove(voice_path)
-            except:
-                pass
+        # -------------------------------------------------
+        # Отримуємо файл Telegram
+        # -------------------------------------------------
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    logger.exception(f"Telegram Error: {context.error}")
+        telegram_file = await context.bot.get_file(
+            telegram_media.file_id
+        )
+
+        # -------------------------------------------------
+        # Тимчасовий файл
+        # -------------------------------------------------
+
+        suffix = os.path.splitext(filename)[1]
+
+        if not suffix:
+            suffix = ".ogg"
+
+        with tempfile.NamedTemporaryFile(
+            suffix=suffix,
+            delete=False,
+        ) as temp_file:
+
+            temp_path = temp_file.name
+
+        # -------------------------------------------------
+        # Завантаження
+        # -------------------------------------------------
+
+        await telegram_file.download_to_drive(
+            custom_path=temp_path
+        )
+
+        # -------------------------------------------------
+        # Повторна перевірка реального розміру
+        # -------------------------------------------------
+
+        actual_size = os.path.getsize(temp_path)
+
+        if actual_size > MAX_FILE_SIZE:
+
+            await status_message.edit_text(
+                "❌ Файл занадто великий.\n"
+                "Максимальний розмір — 25 МБ."
+            )
+
+            return
+
+        # -------------------------------------------------
+        # Whisper
+        # -------------------------------------------------
+
+        text = await transcribe_audio(
+            temp_path,
+            filename,
+        )
+
+        # -------------------------------------------------
+        # Порожній результат
+        # -------------------------------------------------
+
+        if not text:
+
+            await status_message.edit_text(
+                "🤷 Не зміг розібрати текст."
+            )
+
+            return
+
+        # -------------------------------------------------
+        # Безпечний HTML
+        # -------------------------------------------------
+
+        safe_text = html.escape(text)
+
+        result_text = (
+            f"<blockquote expandable>"
+            f"{safe_text}"
+            f"</blockquote>"
+        )
+
+        # -------------------------------------------------
+        # Результат
+        # -------------------------------------------------
+
+        await status_message.edit_text(
+            result_text,
+            parse_mode="HTML",
+        )
+
+        logger.info(
+            "Готово: %s",
+            filename,
+        )
+
+    # =====================================================
+    # ПОМИЛКА
+    # =====================================================
+
+    except Exception as e:
+
+        logger.exception(
+            "Помилка обробки аудіо: %s",
+            e,
+        )
+
+        try:
+
+            if status_message:
+
+                await status_message.edit_text(
+                    "❌ Помилка під час розпізнавання.\n"
+                    "Спробуй ще раз."
+                )
+
+            else:
+
+                await message.reply_text(
+                    "❌ Помилка під час розпізнавання.",
+                    reply_to_message_id=message.message_id,
+                )
+
+        except Exception:
+            pass
+
+    # =====================================================
+    # ВИДАЛЕННЯ ТИМЧАСОВОГО ФАЙЛУ
+    # =====================================================
+
+    finally:
+
+        if (
+            temp_path
+            and os.path.exists(temp_path)
+        ):
+
+            try:
+                os.remove(temp_path)
+
+            except Exception:
+                logger.warning(
+                    "Не вдалося видалити: %s",
+                    temp_path,
+                )
+
+
+# =========================================================
+# GLOBAL ERROR HANDLER
+# =========================================================
+
+async def error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+
+    logger.exception(
+        "Telegram Error: %s",
+        context.error,
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
+
     logger.info("🚀 Запуск WhisperBot...")
-    app = ApplicationBuilder().token(BOT_TOKEN).concurrent_updates(True).build()
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    app.add_error_handler(error_handler)
+    app = (
+        ApplicationBuilder()
+        .token(BOT_TOKEN)
+        .concurrent_updates(True)
+        .build()
+    )
 
-    app.run_polling(drop_pending_updates=True)
+    # /start
+    app.add_handler(
+        CommandHandler(
+            "start",
+            cmd_start,
+        )
+    )
+
+    # Голосові + аудіофайли
+    app.add_handler(
+        MessageHandler(
+            filters.VOICE | filters.AUDIO,
+            handle_audio,
+        )
+    )
+
+    # Глобальні помилки
+    app.add_error_handler(
+        error_handler
+    )
+
+    logger.info(
+        "✅ WhisperBot запущений."
+    )
+
+    app.run_polling(
+        drop_pending_updates=True
+    )
+
+
+# =========================================================
+# START
+# =========================================================
 
 if __name__ == "__main__":
     main()
-            
