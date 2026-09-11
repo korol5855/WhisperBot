@@ -47,6 +47,10 @@ async def transcribe_voice(file_path: str) -> str:
                 file=("voice.ogg", audio_file),
                 response_format="json",
                 temperature=0.0,
+                initial_prompt=(
+                    "Розмова ведеться живою мовою: українською, "
+                    "російською або суржиком. Зберігай оригінальну мову висловлювання."
+                ),
             )
             return result.text.strip()
 
@@ -127,4 +131,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
+        
