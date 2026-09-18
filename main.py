@@ -35,15 +35,10 @@ if not GROQ_API_KEY:
 
 
 # =========================================================
-# МОДЕЛЬ
+# МОДЕЛЬ ТА ЛІМІТИ
 # =========================================================
 
 WHISPER_MODEL = "whisper-large-v3"
-
-
-# =========================================================
-# ЛІМІТИ
-# =========================================================
 
 TRANSCRIPTION_LIMIT = 3
 transcription_semaphore = asyncio.Semaphore(TRANSCRIPTION_LIMIT)
@@ -94,7 +89,7 @@ async def cmd_start(
 
 
 # =========================================================
-# ПЕРЕВІРКА НА ЛАТИНСЬКИЙ ТРАНСЛІТ
+# ЗАХИСТ ВІД ТРАНСЛІТУ ТА ГАЛЮЦИНАЦІЙ
 # =========================================================
 
 def looks_like_latin_translit(text: str) -> bool:
@@ -109,17 +104,12 @@ def looks_like_latin_translit(text: str) -> bool:
         1 for char in text if char.lower() in "абвгдежзийклмнопрстуфхцчшщьюяіїєґ"
     )
 
-    # Якщо є латинські слова, але повністю немає кирилиці — це трансліт
     if latin_letters >= 3 and cyrillic_letters == 0:
         logger.warning("⚠️ Виявлено латинський трансліт: %s", text)
         return True
 
     return False
 
-
-# =========================================================
-# ПЕРЕВІРКА НА ЯВНУ ГАЛЮЦИНАЦІЮ
-# =========================================================
 
 HALLUCINATION_PHRASES = [
     "thanks for watching",
@@ -130,6 +120,10 @@ HALLUCINATION_PHRASES = [
     "дякую за перегляд",
     "підписуйтесь на канал",
     "підписуйся на канал",
+    "субтитры сделал",
+    "dimatorzok",
+    "dima torzok",
+    "subtitles by",
 ]
 
 
@@ -140,7 +134,7 @@ def looks_like_hallucination(text: str) -> bool:
     text_lower = text.lower().strip()
     for phrase in HALLUCINATION_PHRASES:
         if phrase in text_lower:
-            logger.warning("⚠️ Можлива галюцинація Whisper: %s", phrase)
+            logger.warning("⚠️ Виявлено галюцинацію Whisper: %s", phrase)
             return True
 
     return False
@@ -157,7 +151,7 @@ def result_is_suspicious(text: str) -> bool:
 
 
 # =========================================================
-# ОСНОВНА ТРАНСКРИПЦІЯ (ПОКРАЩЕНИЙ КАСКАД)
+# ЗАЛІЗОБЕТОННА ТРАНСКРИПЦІЯ БЕЗ ВИГАДОК
 # =========================================================
 
 async def transcribe_audio(
@@ -167,32 +161,29 @@ async def transcribe_audio(
     async with transcription_semaphore:
         logger.info("🎙️ Починаю транскрипцію: %s", filename)
 
-        # Спроба №1: Auto-detect (найкраще для суржику та змішаної мови)
+        # Спроба №1: Auto-detect
         text_auto = await _request_whisper(file_path, filename, language=None)
         logger.info("📝 Auto результат: %s", text_auto)
         if text_auto and not result_is_suspicious(text_auto):
             return text_auto
 
-        # Спроба №2: Примусова українська
-        logger.warning("⚠️ Auto підозрілий. Пробую примусово uk.")
-        text_uk = await _request_whisper(file_path, filename, language="uk")
-        logger.info("📝 UK результат: %s", text_uk)
-        if text_uk and not result_is_suspicious(text_uk):
-            return text_uk
-
-        # Спроба №3: Примусова російська (для російськомовних фраз/суржику)
-        logger.warning("⚠️ UK теж підозрілий. Пробую примусово ru.")
+        # Спроба №2: Примусово російська (для російськомовних фраз)
+        logger.warning("⚠️ Auto підозрілий. Пробую ru.")
         text_ru = await _request_whisper(file_path, filename, language="ru")
         logger.info("📝 RU результат: %s", text_ru)
         if text_ru and not result_is_suspicious(text_ru):
             return text_ru
 
-        # ЖОДИН ІЗ ВАРІАНТІВ НЕ ІДЕАЛЬНИЙ. Вибираємо найкращий з тих, де немає явного трансліту!
-        for t in [text_auto, text_uk, text_ru]:
-            if t and not looks_like_latin_translit(t) and not looks_like_hallucination(t):
-                return t
+        # Спроба №3: Примусово українська
+        logger.warning("⚠️ RU підозрілий. Пробую uk.")
+        text_uk = await _request_whisper(file_path, filename, language="uk")
+        logger.info("📝 UK результат: %s", text_uk)
+        if text_uk and not result_is_suspicious(text_uk):
+            return text_uk
 
-        # Якщо абсолютно все у трансліті — повертаємо хоч щось чи порожнє, але краще пустий рядок, ніж сміття
+        # ЖОДИН ВАРІАНТ НЕ ПРОЙШОВ ПЕРЕВІРКУ!
+        # Жодного сміття не повертаємо — краще порожньо, ніж галюцинації.
+        logger.error("❌ Усі спроби повернули підозрілий текст або галюцинації. Відхилено.")
         return ""
 
 
@@ -419,4 +410,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
+        
