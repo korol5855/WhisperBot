@@ -33,17 +33,31 @@ if not BOT_TOKEN:
 if not GROQ_API_KEY:
     raise RuntimeError("❌ Не задано GROQ_API_KEY!")
 
+
+# =========================================================
+# МОДЕЛЬ
+# =========================================================
+
 WHISPER_MODEL = "whisper-large-v3"
+
+
+# =========================================================
+# ЛІМІТИ
+# =========================================================
 
 # Максимум одночасних транскрипцій
 TRANSCRIPTION_LIMIT = 3
-transcription_semaphore = asyncio.Semaphore(TRANSCRIPTION_LIMIT)
 
-# Максимальний розмір файлу
+transcription_semaphore = asyncio.Semaphore(
+    TRANSCRIPTION_LIMIT
+)
+
+
+# Максимальний розмір аудіо
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
 
-# Telegram має ліміт близько 4096 символів.
-# Залишаємо запас для HTML.
+
+# Запас до Telegram-ліміту повідомлення
 MAX_MESSAGE_LENGTH = 3800
 
 
@@ -82,197 +96,115 @@ async def cmd_start(
 
     await update.message.reply_text(
         "🎙️ <b>WhisperBot готовий до роботи.</b>\n\n"
-        "Надішли голосове або аудіо — я перетворю його в текст.",
+        "Надішли голосове або аудіо — я перетворю його "
+        "на текст без перекладу та виправлення мови.",
         parse_mode="HTML",
     )
 
 
 # =========================================================
-# ПЕРЕВІРКА НА ПОЛЬСЬКУ / НЕПРАВИЛЬНУ МОВУ
+# ПЕРЕВІРКА НА ЛАТИНСЬКИЙ ТРАНСЛІТ
 # =========================================================
 
-POLISH_WORD_PATTERNS = [
-    r"\bco\b",
-    r"\bże\b",
-    r"\bjest\b",
-    r"\bsię\b",
-    r"\bcię\b",
-    r"\bczy\b",
-    r"\bjak\b",
-    r"\bto\b",
-    r"\bna\b",
-    r"\bdo\b",
-    r"\bzaraz\b",
-    r"\bmyślał\b",
-    r"\bmyśleć\b",
-    r"\bmyślę\b",
-    r"\bczemu\b",
-    r"\bdlaczego\b",
-    r"\bteraz\b",
-    r"\bjeszcze\b",
-    r"\bmoże\b",
-    r"\bbyć\b",
-    r"\bniech\b",
-]
-
-# Польські літери, які дуже добре сигналізують,
-# що Whisper пішов не в ту мову.
-POLISH_CHARS = set("ąćęłńóśźżĄĆĘŁŃÓŚŹŻ")
-
-# Типові польські закінчення/фрагменти.
-POLISH_FRAGMENTS = [
-    "cz",
-    "sz",
-    "rz",
-    "dz",
-    "ści",
-    "śmy",
-    "ście",
-    "owej",
-    "owego",
-    "ami",
-    "ach",
-]
-
-
-def looks_like_wrong_language(text: str) -> bool:
+def looks_like_latin_translit(text: str) -> bool:
     """
-    Перевіряє, чи результат Whisper підозріло схожий
-    на польську або іншу неправильну мову.
+    Виявляє ситуацію, коли Whisper замість кирилиці
+    раптом повернув щось на кшталт:
+
+        A to e havaryu
+
+    Важливо:
+    ми НЕ виправляємо такий текст самостійно.
+    Просто робимо повторний запит до Whisper.
     """
 
     if not text:
         return False
 
-    text_lower = text.lower().strip()
-
-    # -----------------------------------------------------
-    # 1. Польські специфічні символи
-    # -----------------------------------------------------
-
-    polish_char_count = sum(
-        1 for char in text if char in POLISH_CHARS
+    latin_letters = sum(
+        1
+        for char in text
+        if char.lower() in "abcdefghijklmnopqrstuvwxyz"
     )
 
-    # Якщо є хоча б кілька польських специфічних символів
-    # у короткому тексті — це вже сильний сигнал.
-    if polish_char_count >= 2:
-        logger.warning(
-            "⚠️ Виявлено польські специфічні символи: %s",
-            polish_char_count,
+    cyrillic_letters = sum(
+        1
+        for char in text
+        if char.lower()
+        in (
+            "абвгдежзийклмнопрстуфхцчшщьюя"
+            "іїєґ"
         )
-        return True
+    )
 
-    # -----------------------------------------------------
-    # 2. Польські службові слова
-    # -----------------------------------------------------
+    # Якщо є достатньо латинських літер,
+    # але немає кирилиці — дуже схоже на трансліт.
+    if latin_letters >= 4 and cyrillic_letters == 0:
 
-    word_matches = 0
-
-    for pattern in POLISH_WORD_PATTERNS:
-        if re.search(pattern, text_lower):
-            word_matches += 1
-
-    # 2+ характерних слова — вже підозріло.
-    if word_matches >= 2:
         logger.warning(
-            "⚠️ Виявлено польські слова: %s",
-            word_matches,
+            "⚠️ Whisper повернув латиницю замість кирилиці: %s",
+            text,
         )
+
         return True
-
-    # -----------------------------------------------------
-    # 3. Польські характерні фрагменти
-    # -----------------------------------------------------
-
-    fragment_matches = 0
-
-    for fragment in POLISH_FRAGMENTS:
-        if fragment in text_lower:
-            fragment_matches += 1
-
-    # Фрагменти самі по собі слабкий сигнал,
-    # тому вимагаємо декілька.
-    if fragment_matches >= 4:
-        logger.warning(
-            "⚠️ Виявлено багато польських фрагментів: %s",
-            fragment_matches,
-        )
-        return True
-
-    # -----------------------------------------------------
-    # 4. Дуже короткий дивний результат
-    # -----------------------------------------------------
-
-    words = text_lower.split()
-
-    # Наприклад, голосове на 20 секунд,
-    # а Whisper повернув 1-2 дивних слова.
-    if len(words) <= 2:
-        suspicious_words = [
-            "co",
-            "że",
-            "jest",
-            "się",
-            "myślał",
-            "myśleć",
-        ]
-
-        if any(word in suspicious_words for word in words):
-            logger.warning(
-                "⚠️ Дуже короткий підозрілий результат: %s",
-                text,
-            )
-            return True
 
     return False
 
 
 # =========================================================
-# ПЕРЕВІРКА НА WHISPER-ГАЛЮЦИНАЦІЇ
+# ПЕРЕВІРКА НА ЯВНУ ГАЛЮЦИНАЦІЮ
 # =========================================================
 
 HALLUCINATION_PHRASES = [
     "thanks for watching",
     "thank you for watching",
-    "subscribe",
     "like and subscribe",
-    "thank you",
+    "subscribe",
+    "thank you for listening",
     "дякую за перегляд",
     "підписуйтесь на канал",
     "підписуйся на канал",
-    "www.",
-    "http://",
-    "https://",
 ]
 
 
 def looks_like_hallucination(text: str) -> bool:
+    """
+    Ловимо тільки очевидні шаблони галюцинацій.
+
+    НЕ перевіряємо польську.
+    НЕ перевіряємо окремі слова.
+    НЕ намагаємося визначати мову через regex.
+    """
+
     if not text:
         return False
 
     text_lower = text.lower().strip()
 
     for phrase in HALLUCINATION_PHRASES:
+
         if phrase in text_lower:
+
             logger.warning(
-                "⚠️ Виявлено можливу галюцинацію Whisper: %s",
+                "⚠️ Можлива галюцинація Whisper: %s",
                 phrase,
             )
+
             return True
 
     return False
 
 
 # =========================================================
-# ОЦІНКА РЕЗУЛЬТАТУ
+# ЗАГАЛЬНА ПЕРЕВІРКА РЕЗУЛЬТАТУ
 # =========================================================
 
 def result_is_suspicious(text: str) -> bool:
+
     if not text:
         return True
 
-    if looks_like_wrong_language(text):
+    if looks_like_latin_translit(text):
         return True
 
     if looks_like_hallucination(text):
@@ -302,31 +234,50 @@ async def transcribe_audio(
         # Українська як основна мова
         # =================================================
 
-        text_uk = await _request_whisper(
+        text = await _request_whisper(
             file_path=file_path,
             filename=filename,
             language="uk",
         )
 
         logger.info(
-            "📝 Результат uk: %s",
-            text_uk,
+            "📝 Основний результат: %s",
+            text,
         )
 
-        # Якщо українська вийшла нормально —
-        # нічого більше не робимо.
-        if text_uk and not result_is_suspicious(text_uk):
-            return text_uk
+        # Якщо все нормально —
+        # одразу повертаємо результат.
+        if text and not result_is_suspicious(text):
+
+            return text
+
 
         # =================================================
         # СПРОБА №2
-        # Автовизначення мови
+        # AUTO-DETECT
         # =================================================
 
-        logger.warning(
-            "⚠️ Результат uk підозрілий. "
-            "Запускаю повторне розпізнавання з auto-detect."
-        )
+        if looks_like_latin_translit(text):
+
+            logger.warning(
+                "⚠️ Виявлено латинський трансліт."
+                " Повторюю через auto-detect."
+            )
+
+        elif looks_like_hallucination(text):
+
+            logger.warning(
+                "⚠️ Виявлено можливу галюцинацію."
+                " Повторюю через auto-detect."
+            )
+
+        else:
+
+            logger.warning(
+                "⚠️ Основний результат порожній."
+                " Повторюю через auto-detect."
+            )
+
 
         text_auto = await _request_whisper(
             file_path=file_path,
@@ -335,67 +286,33 @@ async def transcribe_audio(
         )
 
         logger.info(
-            "📝 Результат auto: %s",
+            "📝 Auto результат: %s",
             text_auto,
         )
 
+
+        # Якщо auto дав нормальний результат —
+        # використовуємо його.
         if text_auto and not result_is_suspicious(text_auto):
+
             return text_auto
 
-        # =================================================
-        # СПРОБА №3
-        # Примусова російська
-        # =================================================
-
-        logger.warning(
-            "⚠️ Auto результат теж підозрілий. "
-            "Запускаю повторне розпізнавання з language='ru'."
-        )
-
-        text_ru = await _request_whisper(
-            file_path=file_path,
-            filename=filename,
-            language="ru",
-        )
-
-        logger.info(
-            "📝 Результат ru: %s",
-            text_ru,
-        )
 
         # =================================================
-        # ВИБІР РЕЗУЛЬТАТУ
+        # ЗАПОБІЖНИК
         # =================================================
 
-        candidates = [
-            ("uk", text_uk),
-            ("auto", text_auto),
-            ("ru", text_ru),
-        ]
+        # Якщо повтор теж дивний,
+        # не робимо третій запит.
+        #
+        # Це важливо:
+        # не витрачаємо API на нескінченні спроби
+        # та не починаємо "виправляти" слова самостійно.
 
-        valid_candidates = [
-            (name, text)
-            for name, text in candidates
-            if text and not result_is_suspicious(text)
-        ]
+        if text:
+            return text
 
-        if valid_candidates:
-            # Перевага українському результату.
-            for name, text in valid_candidates:
-                if name == "uk":
-                    return text
-
-            return valid_candidates[0][1]
-
-        # Якщо всі результати підозрілі,
-        # краще повернути український, якщо він є.
-        if text_uk:
-            return text_uk
-
-        if text_auto:
-            return text_auto
-
-        return text_ru
+        return text_auto
 
 
 # =========================================================
@@ -408,7 +325,10 @@ async def _request_whisper(
     language: str | None = None,
 ) -> str:
 
-    with open(file_path, "rb") as audio_file:
+    with open(
+        file_path,
+        "rb",
+    ) as audio_file:
 
         kwargs = {
             "model": WHISPER_MODEL,
@@ -420,35 +340,70 @@ async def _request_whisper(
 
             "response_format": "json",
 
-            # Мінімізуємо випадкові вигадки.
+            # Максимально стабільний режим
             "temperature": 0.0,
 
+            # =================================================
+            # ГОЛОВНИЙ PROMPT
+            # =================================================
+            #
+            # Тут НЕ кажемо "переклади".
+            #
+            # Навпаки:
+            # просто записати те, що сказано.
+            #
             "prompt": (
-                "Це реальна розмовна мова. "
-                "Основна мова — українська. "
-                "Також можлива російська мова та суржик. "
-                "Потрібна дослівна транскрипція того, що реально чути. "
-                "Не перекладай текст. "
-                "Не вигадуй слова. "
-                "Не змінюй мову мовця. "
-                "Зберігай сленг, матюки, імена, назви та авторську лексику."
+                "Це жива розмовна українська мова. "
+                "У розмові можуть бути російські слова, "
+                "російські фрази та суржик. "
+                "Транскрибуй дослівно те, що говорить людина. "
+                "Не перекладай. "
+                "Не перефразовуй. "
+                "Не виправляй граматику. "
+                "Не замінюй російські слова українськими. "
+                "Не замінюй українські слова російськими. "
+                "Не виправляй суржик на літературну мову. "
+                "Зберігай сленг, матюки, скорочення, "
+                "розмовні слова та імена. "
+                "Записуй текст кирилицею."
             ),
         }
 
+
+        # =================================================
+        # LANGUAGE
+        # =================================================
+
         if language:
+
             kwargs["language"] = language
+
+
+        # =================================================
+        # ЗАПИТ
+        # =================================================
 
         result = await client.audio.transcriptions.create(
             **kwargs
         )
 
-    text = getattr(result, "text", "") or ""
+
+    # =====================================================
+    # ОТРИМУЄМО ТЕКСТ
+    # =====================================================
+
+    text = getattr(
+        result,
+        "text",
+        "",
+    ) or ""
+
 
     return text.strip()
 
 
 # =========================================================
-# РОЗБИВАННЯ ТЕКСТУ ДЛЯ TELEGRAM
+# РОЗБИВАННЯ ДОВГОГО ТЕКСТУ
 # =========================================================
 
 def split_text(
@@ -459,15 +414,19 @@ def split_text(
     if len(text) <= max_length:
         return [text]
 
+
     parts = []
     current = ""
+
 
     for paragraph in text.split("\n"):
 
         paragraph = paragraph.strip()
 
+
         if not paragraph:
             continue
+
 
         while len(paragraph) > max_length:
 
@@ -477,20 +436,29 @@ def split_text(
                 max_length,
             )
 
+
             if cut <= 0:
                 cut = max_length
+
 
             parts.append(
                 paragraph[:cut].strip()
             )
 
-            paragraph = paragraph[cut:].strip()
+
+            paragraph = paragraph[
+                cut:
+            ].strip()
+
 
         if not paragraph:
             continue
 
+
         if not current:
+
             current = paragraph
+
 
         elif (
             len(current)
@@ -498,14 +466,23 @@ def split_text(
             + len(paragraph)
             <= max_length
         ):
-            current += "\n" + paragraph
+
+            current += (
+                "\n"
+                + paragraph
+            )
+
 
         else:
+
             parts.append(current)
+
             current = paragraph
+
 
     if current:
         parts.append(current)
+
 
     return parts
 
@@ -521,24 +498,36 @@ async def send_transcription(
 
     parts = split_text(text)
 
+
     for index, part in enumerate(parts):
 
-        safe_text = html.escape(part)
-
-        result_text = (
-            f"<blockquote expandable>"
-            f"{safe_text}"
-            f"</blockquote>"
+        safe_text = html.escape(
+            part
         )
 
+
+        result_text = (
+            "<blockquote expandable>"
+            f"{safe_text}"
+            "</blockquote>"
+        )
+
+
+        # Перше повідомлення —
+        # відповідь саме на голосове.
         if index == 0:
 
             await message.reply_text(
                 result_text,
                 parse_mode="HTML",
-                reply_to_message_id=message.message_id,
+                reply_to_message_id=(
+                    message.message_id
+                ),
             )
 
+
+        # Наступні частини —
+        # звичайними повідомленнями.
         else:
 
             await message.reply_text(
@@ -548,7 +537,7 @@ async def send_transcription(
 
 
 # =========================================================
-# ОБРОБКА АУДІО / VOICE
+# ОБРОБКА VOICE / AUDIO
 # =========================================================
 
 async def handle_audio(
@@ -558,17 +547,21 @@ async def handle_audio(
 
     message = update.message
 
+
     if not message:
         return
 
+
     # =====================================================
-    # ВИЗНАЧАЄМО ТИП ФАЙЛУ
+    # ВИЗНАЧАЄМО ТИП АУДІО
     # =====================================================
 
     if message.voice:
 
         telegram_media = message.voice
+
         filename = "voice.ogg"
+
 
     elif message.audio:
 
@@ -579,8 +572,11 @@ async def handle_audio(
             or "audio.mp3"
         )
 
+
     else:
+
         return
+
 
     # =====================================================
     # ПЕРЕВІРКА РОЗМІРУ
@@ -588,19 +584,25 @@ async def handle_audio(
 
     if (
         telegram_media.file_size
-        and telegram_media.file_size > MAX_FILE_SIZE
+        and
+        telegram_media.file_size
+        > MAX_FILE_SIZE
     ):
 
         await message.reply_text(
             "❌ Файл занадто великий "
             "(ліміт 25 МБ).",
-            reply_to_message_id=message.message_id,
+            reply_to_message_id=(
+                message.message_id
+            ),
         )
 
         return
 
+
     temp_path = None
     status_message = None
+
 
     try:
 
@@ -613,68 +615,96 @@ async def handle_audio(
             action=ChatAction.TYPING,
         )
 
+
         # =================================================
         # СТАТУС
         # =================================================
 
-        status_message = await message.reply_text(
-            "🎙️ <i>Розпізнаю...</i>",
-            parse_mode="HTML",
-            reply_to_message_id=message.message_id,
+        status_message = (
+            await message.reply_text(
+                "🎙️ <i>Розпізнаю...</i>",
+                parse_mode="HTML",
+                reply_to_message_id=(
+                    message.message_id
+                ),
+            )
         )
+
 
         # =================================================
         # ОТРИМУЄМО ФАЙЛ TELEGRAM
         # =================================================
 
-        telegram_file = await context.bot.get_file(
-            telegram_media.file_id
+        telegram_file = (
+            await context.bot.get_file(
+                telegram_media.file_id
+            )
         )
+
 
         # =================================================
         # ТИМЧАСОВИЙ ФАЙЛ
         # =================================================
 
         suffix = (
-            os.path.splitext(filename)[1]
+            os.path.splitext(
+                filename
+            )[1]
             or ".ogg"
         )
+
 
         with tempfile.NamedTemporaryFile(
             suffix=suffix,
             delete=False,
         ) as temp_file:
 
-            temp_path = temp_file.name
+            temp_path = (
+                temp_file.name
+            )
+
 
         # =================================================
-        # ЗАВАНТАЖЕННЯ
+        # ЗАВАНТАЖУЄМО
         # =================================================
 
         await telegram_file.download_to_drive(
             custom_path=temp_path
         )
 
+
+        # =================================================
+        # ПЕРЕВІРЯЄМО ФАЙЛ
+        # =================================================
+
         if (
-            not os.path.exists(temp_path)
-            or os.path.getsize(temp_path) == 0
-        ):
-            raise RuntimeError(
-                "Не вдалося завантажити файл "
-                "або він порожній."
+            not os.path.exists(
+                temp_path
             )
+            or
+            os.path.getsize(
+                temp_path
+            ) == 0
+        ):
+
+            raise RuntimeError(
+                "Не вдалося завантажити "
+                "файл або він порожній."
+            )
+
 
         # =================================================
         # ТРАНСКРИПЦІЯ
         # =================================================
 
         text = await transcribe_audio(
-            temp_path,
-            filename,
+            file_path=temp_path,
+            filename=filename,
         )
 
+
         # =================================================
-        # НЕМАЄ ТЕКСТУ
+        # ЯКЩО ТЕКСТУ НЕМАЄ
         # =================================================
 
         if not text:
@@ -685,8 +715,9 @@ async def handle_audio(
 
             return
 
+
         # =================================================
-        # ВИДАЛЯЄМО СТАТУС
+        # ВИДАЛЯЄМО "РОЗПІЗНАЮ..."
         # =================================================
 
         try:
@@ -697,8 +728,9 @@ async def handle_audio(
 
             pass
 
+
         # =================================================
-        # ВІДПРАВЛЯЄМО РЕЗУЛЬТАТ
+        # ВІДПРАВЛЯЄМО ТЕКСТ
         # =================================================
 
         await send_transcription(
@@ -706,10 +738,16 @@ async def handle_audio(
             text,
         )
 
+
         logger.info(
             "✅ Успішно оброблено: %s",
             filename,
         )
+
+
+    # =====================================================
+    # ПОМИЛКА
+    # =====================================================
 
     except Exception as e:
 
@@ -717,6 +755,7 @@ async def handle_audio(
             "❌ Помилка обробки: %s",
             e,
         )
+
 
         try:
 
@@ -728,31 +767,41 @@ async def handle_audio(
                     parse_mode="HTML",
                 )
 
+
             else:
 
                 await message.reply_text(
                     "❌ Помилка розпізнавання.",
-                    reply_to_message_id=message.message_id,
+                    reply_to_message_id=(
+                        message.message_id
+                    ),
                 )
+
 
         except Exception:
 
             pass
 
-    finally:
 
-        # =================================================
-        # ВИДАЛЯЄМО ТИМЧАСОВИЙ ФАЙЛ
-        # =================================================
+    # =====================================================
+    # ВИДАЛЕННЯ ТИМЧАСОВОГО ФАЙЛУ
+    # =====================================================
+
+    finally:
 
         if (
             temp_path
-            and os.path.exists(temp_path)
+            and
+            os.path.exists(
+                temp_path
+            )
         ):
 
             try:
 
-                os.remove(temp_path)
+                os.remove(
+                    temp_path
+                )
 
             except Exception:
 
@@ -760,7 +809,7 @@ async def handle_audio(
 
 
 # =========================================================
-# ОБРОБКА ПОМИЛОК
+# ГЛОБАЛЬНИЙ ОБРОБНИК ПОМИЛОК
 # =========================================================
 
 async def error_handler(
@@ -776,14 +825,15 @@ async def error_handler(
 
 
 # =========================================================
-# ЗАПУСК
+# ЗАПУСК БОТА
 # =========================================================
 
 def main():
 
     logger.info(
-        "🚀 Запуск покращеного WhisperBot..."
+        "🚀 Запуск WhisperBot..."
     )
+
 
     app = (
         ApplicationBuilder()
@@ -792,7 +842,11 @@ def main():
         .build()
     )
 
-    # /start
+
+    # =====================================================
+    # /START
+    # =====================================================
+
     app.add_handler(
         CommandHandler(
             "start",
@@ -800,7 +854,11 @@ def main():
         )
     )
 
-    # Voice + Audio
+
+    # =====================================================
+    # VOICE + AUDIO
+    # =====================================================
+
     app.add_handler(
         MessageHandler(
             filters.VOICE | filters.AUDIO,
@@ -808,15 +866,25 @@ def main():
         )
     )
 
-    # Помилки
+
+    # =====================================================
+    # ПОМИЛКИ
+    # =====================================================
+
     app.add_error_handler(
         error_handler
     )
+
 
     logger.info(
         "✅ Бот успішно запущений "
         "і готовий до роботи."
     )
+
+
+    # =====================================================
+    # POLLING
+    # =====================================================
 
     app.run_polling(
         drop_pending_updates=True
@@ -828,4 +896,5 @@ def main():
 # =========================================================
 
 if __name__ == "__main__":
+
     main()
