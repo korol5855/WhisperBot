@@ -4,6 +4,9 @@ import logging
 import tempfile
 import html
 import re
+import http.server
+import socketserver
+import threading
 
 from telegram import Update
 from telegram.constants import ChatAction
@@ -70,6 +73,30 @@ client = AsyncGroq(
 
 
 # =========================================================
+# ФОНОВИЙ HTTP-СЕРВЕР ДЛЯ ХОСТИНГУ (Koyeb / Render)
+# =========================================================
+
+def run_dummy_server():
+    port = int(os.getenv("PORT", "8000"))
+    
+    class HealthCheckHandler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"Bot is alive!")
+            
+        def log_message(self, format, *args):
+            pass  # Прибираємо зайві логи заглушки в консолі
+
+    try:
+        with socketserver.TCPServer(("", port), HealthCheckHandler) as httpd:
+            logger.info(f"🌐 HTTP-заглушка запущена на порті {port}")
+            httpd.serve_forever()
+    except Exception as e:
+        logger.error(f"Помилка запуску HTTP-заглушки: {e}")
+
+
+# =========================================================
 # /START
 # =========================================================
 
@@ -93,7 +120,6 @@ async def cmd_start(
 # =========================================================
 
 def looks_like_latin_translit(text: str) -> bool:
-    """Виявляє випадки, коли Whisper видає латиницю замість кирилиці."""
     if not text:
         return False
 
@@ -167,7 +193,7 @@ async def transcribe_audio(
         if text_auto and not result_is_suspicious(text_auto):
             return text_auto
 
-        # Спроба №2: Примусово російська (для російськомовних фраз)
+        # Спроба №2: Примусово російська
         logger.warning("⚠️ Auto підозрілий. Пробую ru.")
         text_ru = await _request_whisper(file_path, filename, language="ru")
         logger.info("📝 RU результат: %s", text_ru)
@@ -181,8 +207,6 @@ async def transcribe_audio(
         if text_uk and not result_is_suspicious(text_uk):
             return text_uk
 
-        # ЖОДИН ВАРІАНТ НЕ ПРОЙШОВ ПЕРЕВІРКУ!
-        # Жодного сміття не повертаємо — краще порожньо, ніж галюцинації.
         logger.error("❌ Усі спроби повернули підозрілий текст або галюцинації. Відхилено.")
         return ""
 
@@ -341,7 +365,7 @@ async def handle_audio(
         if not os.path.exists(temp_path) or os.path.getsize(temp_path) == 0:
             raise RuntimeError("Не вдалося завантажити файл або він порожній.")
 
-        text = await transcribe_audio(temp_path, filename)
+        text = await transcribe_audio(temp_path, filename, message.chat_id) if 'message' in locals() else await transcribe_audio(temp_path, filename)
 
         if not text:
             await status_message.edit_text("🤷 Не вдалося розібрати слова.")
@@ -393,6 +417,10 @@ async def error_handler(
 def main():
     logger.info("🚀 Запуск фінального WhisperBot...")
 
+    # Запускаємо фоновий вебсервер для проходження перевірок хостингу
+    server_thread = threading.Thread(target=run_dummy_server, daemon=True)
+    server_thread.start()
+
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
@@ -410,4 +438,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
